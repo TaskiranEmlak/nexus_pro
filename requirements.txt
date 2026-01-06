@@ -1,0 +1,22 @@
+# NEXUS PRO - Dependencies
+# ========================
+
+# Core
+aiohttp>=3.8.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Exchange API
+python-binance>=1.0.17
+
+# Machine Learning (optional, for RL)
+# stable-baselines3>=2.0.0
+# gymnasium>=0.28.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# API / ROI
+fastapi>=0.100.0
+uvicorn>=0.20.0
+websockets>=11.0
