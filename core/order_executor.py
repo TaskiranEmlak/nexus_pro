@@ -8,7 +8,118 @@
 import logging
 import asyncio
 from typing import Dict, Optional, List, Callable
-# ... imports ...
+from decimal import Decimal, ROUND_DOWN
+import time
+
+try:
+    from binance import AsyncClient
+    from binance.exceptions import BinanceAPIException, BinanceOrderException
+    BINANCE_AVAILABLE = True
+except ImportError:
+    BINANCE_AVAILABLE = False
+    AsyncClient = None
+    BinanceAPIException = Exception
+    BinanceOrderException = Exception
+
+# Logger setup inside module explicitly if utils fails in future
+logger = logging.getLogger("core_exec")
+
+class OrderExecutor:
+    """
+    Emir İletim Motoru
+    - Rate limit koruması
+    - Hata yönetimi (Retry)
+    - Post-Only desteği
+    """
+    
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.testnet = testnet
+        self.client: Optional[AsyncClient] = None
+        self.active_orders = {} # Track orders locally
+        
+        # Simulation Check
+        self.simulation_mode = not (self.api_key and self.api_secret)
+        if self.simulation_mode:
+            logger.warning("⚠️ No API Keys found. Running in SIMULATION MODE (Paper Trading).")
+
+    async def connect(self):
+        """Borsa bağlantısı"""
+        if self.simulation_mode:
+            logger.info("✅ Simulation Mode Active: Skipping Exchange Connection")
+            return
+
+        try:
+            self.client = await AsyncClient.create(
+                self.api_key, 
+                self.api_secret, 
+                testnet=self.testnet
+            )
+            logger.info("✅ OrderExecutor Connected to Exchange")
+        except Exception as e:
+            logger.error(f"❌ Connection Failed: {e}")
+            raise
+
+    async def disconnect(self):
+        """Bağlantıyı kes"""
+        if self.client:
+            await self.client.close_connection()
+
+    async def place_limit_order(
+        self, 
+        symbol: str, 
+        side: str, 
+        quantity: float, 
+        price: float,
+        reduce_only: bool = False,
+        post_only: bool = True
+    ) -> Optional[Dict]:
+        """Limit emir gönder (veya simüle et)"""
+        qty_str = f"{quantity:.3f}"
+        price_str = f"{price:.2f}"
+            
+        if self.simulation_mode:
+            # Simulate Order Placement
+            order_id = int(time.time() * 1000)
+            mock_order = {
+                'orderId': order_id,
+                'symbol': symbol,
+                'status': 'NEW',
+                'price': price_str,
+                'origQty': qty_str,
+                'side': side,
+                'type': 'LIMIT',
+                'timeInForce': 'GTX' if post_only else 'GTC'
+            }
+            logger.info(f"🧪 [SIMULATION] Limit Order: {side} {symbol} {qty_str} @ {price_str}")
+            self.active_orders[order_id] = mock_order
+            return mock_order
+
+        if not self.client:
+            logger.error("Client not connected!")
+            return None
+            
+        try:
+            time_in_force = "GTX" if post_only else "GTC"
+            # logger.info(f"🚀 Placing Order: {side} {symbol} {qty_str} @ {price_str}")
+            
+            order = await self.client.futures_create_order(
+                symbol=symbol,
+                side=side,
+                type="LIMIT",
+                timeInForce=time_in_force,
+                quantity=qty_str,
+                price=price_str,
+                reduceOnly=reduce_only
+            )
+            
+            self.active_orders[order['orderId']] = order
+            return order
+            
+        except Exception as e:
+            logger.error(f"❌ Limit Order Failed: {e}")
+            return None
 
     async def place_maker_order_with_chase(
         self,
@@ -27,7 +138,7 @@ from typing import Dict, Optional, List, Callable
             # 1. Güncel en iyi fiyatı al
             current_price = price_provider_callback(symbol, side)
             if not current_price:
-                logger.warning(f"Fiyat alınamadı {symbol}, deneme {i+1}")
+                # Fiyat yoksa bekleme, sonraki denemeye geç
                 await asyncio.sleep(0.5)
                 continue
                 
@@ -37,7 +148,6 @@ from typing import Dict, Optional, List, Callable
             )
             
             if not order:
-                logger.warning(f"Emir gönderilemedi {symbol}, tekrar deneniyor...")
                 await asyncio.sleep(0.5)
                 continue
                 
@@ -48,17 +158,13 @@ from typing import Dict, Optional, List, Callable
             filled = False
             
             while time.time() - start_time < timeout:
-                # Emrin durumunu kontrol et
-                if self.simulation_mode:
-                    filled = True # Simülasyonda hemen doldu varsay
-                    break
-                    
                 status = await self.get_order_status(symbol, order_id)
+                
                 if status == "FILLED":
                     filled = True
                     break
-                elif status == "CANCELED" or status == "EXPIRED":
-                    break # Post-Only reject yedi, muhtemelen fiyat kaçtı
+                elif status in ["CANCELED", "EXPIRED", "REJECTED"]:
+                    break # Post-Only reject
                     
                 await asyncio.sleep(0.5)
                 
@@ -67,17 +173,18 @@ from typing import Dict, Optional, List, Callable
                 return order
             else:
                 # Dolmadı, iptal et ve yeni fiyatla dene
-                logger.info(f"⏳ Order Timeout ({i+1}/{max_retries}). Chasing price...")
+                logger.info(f"⏳ Chase Timeout ({i+1}/{max_retries}). Cancelling...")
                 await self.cancel_order(symbol, order_id)
-                await asyncio.sleep(0.2) # Rate limit koruma
+                await asyncio.sleep(0.2)
                 
-        # Son çare: Market Order (veya iptal)
+        # Son çare: Market Order
         logger.warning(f"⚠️ Chase failed after {max_retries} tries. Executing MARKET.")
         return await self.place_market_order(symbol, side, quantity)
 
     async def get_order_status(self, symbol: str, order_id: int):
         """Tekil emir durumu sorgula"""
-        if self.simulation_mode: return "FILLED"
+        if self.simulation_mode: return "FILLED" # Simülasyonda her şey hemen dolar
+        
         try:
              order = await self.client.futures_get_order(symbol=symbol, orderId=order_id)
              return order['status']
@@ -107,16 +214,12 @@ from typing import Dict, Optional, List, Callable
     async def cancel_order(self, symbol: str, order_id: int):
         """Emir iptal et"""
         if self.simulation_mode:
-            if order_id in self.active_orders:
-                del self.active_orders[order_id]
-            logger.info(f"🧪 [SIMULATION] Order Cancelled: {order_id}")
+            self.active_orders.pop(order_id, None)
             return
 
         try:
             await self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
-            if order_id in self.active_orders:
-                del self.active_orders[order_id]
-            logger.info(f"🗑️ Order Cancelled: {order_id}")
+            self.active_orders.pop(order_id, None)
         except Exception as e:
             logger.error(f"Cancel Failed: {e}")
 
@@ -124,12 +227,10 @@ from typing import Dict, Optional, List, Callable
         """Tüm emirleri iptal et"""
         if self.simulation_mode:
             self.active_orders.clear()
-            logger.info(f"🧪 [SIMULATION] All Orders Cancelled")
             return
 
         try:
             await self.client.futures_cancel_all_open_orders(symbol=symbol)
-            logger.info(f"🗑️ All Orders Cancelled for {symbol}")
             self.active_orders.clear() 
         except Exception as e:
             logger.error(f"Cancel All Failed: {e}")
