@@ -15,6 +15,8 @@ from datetime import datetime
 # Nexus Pro modülleri
 from config import settings, load_settings_from_env
 from core import DataProvider
+from core.stream_manager import StreamManager
+from ai.microstructure import MicrostructureAnalyzer
 from ai import (
     SignalGenerator, 
     TechnicalAnalyzer,
@@ -94,6 +96,10 @@ class NexusPro:
         import api.server
         api.server.bot_instance = self
         
+        # HFT Components (Phase 2)
+        self.stream_manager: Optional[StreamManager] = None
+        self.micro_analyzer = MicrostructureAnalyzer()
+        
         logger.info("🚀 NEXUS PRO initialized")
         
     async def start(self):
@@ -127,6 +133,23 @@ class NexusPro:
         # Heartbeat loop
         asyncio.create_task(self._heartbeat_loop())
         
+        # Time-Based Exit loop (Scalping - 3dk timeout)
+        asyncio.create_task(self._time_based_exit_loop())
+        
+        # HMM Auto-Retrain loop (6 saatte bir)
+        asyncio.create_task(self._hmm_retrain_loop())
+        
+        # Start L2 Stream (HFT)
+        try:
+             # Sadece ilk 5 sembolü dinle (Test için - API limitini korumak için)
+             watch_list = self.symbols[:5] 
+             if watch_list:
+                 self.stream_manager = StreamManager(watch_list)
+                 self.stream_manager.add_callback(self.on_l2_update)
+                 await self.stream_manager.start()
+        except Exception as e:
+            logger.error(f"Stream Manager Başlatılamadı: {e}")
+        
         # Ana döngü
         try:
             await self.data_provider.start(
@@ -138,6 +161,110 @@ class NexusPro:
         finally:
             await self.stop()
             
+    async def on_l2_update(self, symbol: str, data_type: str, data: dict):
+        """HFT Veri Akışı Handler (L2 OrderBook)"""
+        # HFT aktif değilse işlem yapma
+        if not settings.trading.hft_enabled:
+            return
+            
+        if data_type == "ORDER_BOOK":
+            # 1. HMM Kontrolü (HFT sadece Trending'de veya belirli rejimde çalışsın)
+            # Rejim verisi mum kapanışlarında güncelleniyor, hafızadan çekelim
+            # Şimdilik basitleştirilmiş: OFI sinyali çok güçlüyse gir.
+            
+            # 2. OFI Hesapla
+            ofi = self.micro_analyzer.calculate_ofi(data)
+            
+            # 3. Pozisyon Kontrolü (Zaten açıksa ekleme yapma - Scalping modu)
+            if symbol in self.risk_manager.open_positions:
+                # Çıkış sinyali mi? (Ters OFI)
+                pos = self.risk_manager.open_positions[symbol]
+                if (pos.direction == "BUY" and ofi < -0.6) or (pos.direction == "SELL" and ofi > 0.6):
+                     # Erken çıkış (Scalp Take Profit/Stop)
+                     ticker = self.data_provider.get_ticker(symbol)
+                     if ticker:
+                         await self.close_trade(symbol, pos, ticker['price'], "OFI_REVERSAL")
+                return
+
+            # 4. Giriş Sinyali (Eşik: 0.4)
+            threshold = settings.trading.ofi_threshold
+            
+            if abs(ofi) > threshold:
+                direction = "BUY" if ofi > 0 else "SELL"
+                
+                # Fiyatı al (Market emri için yaklaşık fiyat)
+                # Emir defterinden en iyi fiyatı çekebiliriz
+                best_price = data['asks'][0][0] if direction == "BUY" else data['bids'][0][0]
+                
+                logger.info(f"⚡ HFT SIGNAL: {symbol} OFI: {ofi:.2f} -> {direction}")
+                
+                # Scalp Pozisyonu Aç
+                quantity = self.risk_manager.calculate_position_size(1000, best_price, best_price*0.99) # Basit size
+                
+                # Emir Gönder (MARKET - Hız önemli)
+                if self.order_executor:
+                    order = await self.order_executor.place_market_order(symbol, direction, quantity)
+                    if order:
+                         # Risk Manager'a kaydet (Hızlı SL/TP ile)
+                         sl_pct = 0.003 # %0.3 SL (Çok dar)
+                         tp_pct = 0.005 # %0.5 TP
+                         
+                         sl = best_price * (1 - sl_pct) if direction == "BUY" else best_price * (1 + sl_pct)
+                         tp = best_price * (1 + tp_pct) if direction == "BUY" else best_price * (1 - tp_pct)
+                         
+                         self.risk_manager.open_position(symbol, direction, best_price, quantity, sl, tp)
+                         await broadcast_log(f"⚡ SCALP ENTRY: {symbol} {direction} @ {best_price}")
+
+
+    async def on_l2_update(self, symbol: str, data_type: str, data: dict):
+        """HFT Veri Akışı Handler (L2 OrderBook)"""
+        # HFT aktif değilse işlem yapma
+        if not settings.trading.hft_enabled:
+            return
+            
+        if data_type == "ORDER_BOOK":
+            # OFI Hesapla
+            ofi = self.micro_analyzer.calculate_ofi(data)
+            
+            # 3. Pozisyon Kontrolü (Zaten açıksa ekleme yapma - Scalping modu)
+            if symbol in self.risk_manager.open_positions:
+                # Çıkış sinyali mi? (Ters OFI)
+                pos = self.risk_manager.open_positions[symbol]
+                if (pos.direction == "BUY" and ofi < -0.6) or (pos.direction == "SELL" and ofi > 0.6):
+                     # Erken çıkış (Scalp Take Profit/Stop)
+                     ticker = self.data_provider.get_ticker(symbol)
+                     if ticker:
+                         await self.close_trade(symbol, pos, ticker['price'], "OFI_REVERSAL")
+                return
+
+            # 4. Giriş Sinyali (Eşik: 0.4)
+            threshold = settings.trading.ofi_threshold
+            
+            if abs(ofi) > threshold:
+                direction = "BUY" if ofi > 0 else "SELL"
+                
+                # Fiyatı al (Market emri için yaklaşık fiyat)
+                best_price = data['asks'][0][0] if direction == "BUY" else data['bids'][0][0]
+                
+                logger.debug(f"⚡ HFT SIGNAL: {symbol} OFI: {ofi:.2f} -> {direction}")
+                
+                # Scalp Pozisyonu Aç
+                quantity = self.risk_manager.calculate_position_size(1000, best_price, best_price*0.99) # Basit size
+                
+                # Risk Manager'a kaydet (Hızlı SL/TP ile)
+                sl_pct = 0.003 # %0.3 SL (Çok dar)
+                tp_pct = 0.005 # %0.5 TP
+                
+                sl = best_price * (1 - sl_pct) if direction == "BUY" else best_price * (1 + sl_pct)
+                tp = best_price * (1 + tp_pct) if direction == "BUY" else best_price * (1 - tp_pct)
+                
+                # Emir Gönder (MARKET - Hız önemli)
+                if self.order_executor and not self.order_executor.simulation_mode:
+                     await self.order_executor.place_market_order(symbol, direction, quantity)
+                         
+                self.risk_manager.open_position(symbol, direction, best_price, quantity, sl, tp)
+                await broadcast_log(f"⚡ SCALP ENTRY: {symbol} {direction} @ {best_price} (OFI: {ofi:.2f})")
+
     async def _init_session(self):
         """Session başlat"""
         import aiohttp
@@ -152,11 +279,57 @@ class NexusPro:
             current_time = datetime.now().strftime("%H:%M:%S")
             logger.info(f"🟢 Sistem Aktif | {len(self.symbols)} Sembol taranıyor... | {current_time}")
             
+    async def _time_based_exit_loop(self):
+        """Zaman Bazlı Çıkış Kontrolü (Scalping için kritik)"""
+        max_hold_time = settings.trading.max_scalp_hold_time  # saniye
+        
+        while self._running:
+            await asyncio.sleep(10)  # Her 10 saniyede kontrol
+            
+            current_time = datetime.now()
+            positions_to_close = []
+            
+            for symbol, pos in self.risk_manager.open_positions.items():
+                # Pozisyon yaşı (datetime objesi farkı)
+                age_seconds = (current_time - pos.entry_time).total_seconds()
+                
+                if age_seconds > max_hold_time:
+                    # Zaman aşımı - Breakeven veya mevcut fiyattan kapat
+                    positions_to_close.append((symbol, pos))
+                    
+            for symbol, pos in positions_to_close:
+                ticker = self.data_provider.get_ticker(symbol)
+                if ticker:
+                    price = ticker['price']
+                    await self.close_trade(symbol, pos, price, "TIME_EXIT")
+                    logger.info(f"⏱️ TIME EXIT: {symbol} - Held for {max_hold_time}s+")
+                    
+    async def _hmm_retrain_loop(self):
+        """HMM Modelini periyodik olarak yeniden eğit"""
+        retrain_interval = 6 * 60 * 60  # 6 saat
+        
+        while self._running:
+            await asyncio.sleep(retrain_interval)
+            
+            if self.hmm_detector:
+                logger.info("🧠 HMM Model Retrain başlıyor...")
+                try:
+                    # BTC verisini çek ve modeli yeniden eğit
+                    btc_data = self.data_provider.get_klines("BTCUSDT", "1h")
+                    if btc_data is not None and len(btc_data) > 100:
+                        self.hmm_detector.train(btc_data)
+                        logger.info("✅ HMM Model yeniden eğitildi!")
+                except Exception as e:
+                    logger.error(f"HMM Retrain hatası: {e}")
+            
     async def stop(self):
         """Botu durdur"""
         logger.info("🛑 NEXUS PRO durduruluyor...")
         self._running = False
         await self.data_provider.stop()
+        
+        if self.stream_manager:
+            await self.stream_manager.stop()
         
         if self.order_executor:
             await self.order_executor.disconnect()
@@ -385,6 +558,7 @@ class NexusPro:
                 quantity=quantity,
                 stop_loss=sl_price,
                 take_profit=tp_price
+            )
         
     async def manage_positions(self, symbol: str, current_price: float):
         """Açık pozisyonları izle ve SL/TP kontrolü yap"""

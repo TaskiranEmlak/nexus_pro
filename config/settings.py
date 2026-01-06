@@ -30,6 +30,11 @@ class TradingSettings:
     max_signals_per_day: int = 100
     min_confidence: float = 0.65  # 65+ puan geçer
     
+    # HFT / Scalping Settings
+    hft_enabled: bool = True  # GOD MODE
+    max_scalp_hold_time: int = 180 
+    ofi_threshold: float = 0.4
+    
     # Timeframe
     primary_timeframe: str = "5m"
     confirmation_timeframes: List[str] = field(default_factory=lambda: ["15m", "1h"])
