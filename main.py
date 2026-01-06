@@ -266,18 +266,32 @@ class NexusPro:
                     logger.info(f"⏱️ TIME EXIT: {symbol} - Held for {max_hold_time}s+")
                     
     async def _hmm_retrain_loop(self):
-        """HMM Modelini periyodik olarak yeniden eğit"""
-        retrain_interval = 6 * 60 * 60  # 6 saat
-        
-        while self._running:
-            await asyncio.sleep(retrain_interval)
-            
-    async def _hmm_retrain_loop(self):
         """HMM Modelini periyodik olarak yeniden eğit (Thread-Safe)"""
-        retrain_interval = 6 * 60 * 60  # 6 saat
+        retrain_interval = 4 * 60 * 60  # 4 saat
         
         while self._running:
             await asyncio.sleep(retrain_interval)
+            logger.info("🔄 HMM Retraining Started...")
+            
+            try:
+                # BTC verisi çek (Piyasa rejimi için proxy)
+                # 15m mumlar, 2000 veri noktası
+                df = await self.data_provider.get_klines("BTCUSDT", "15m", limit=2000)
+                
+                if df is not None and len(df) > 500:
+                    # Blocking işlemi thread'e at
+                    await asyncio.to_thread(self.hmm_regime.train_model, df)
+                    
+                    # Yeni rejimi güncelle
+                    current_regime = self.hmm_regime.predict_regime(df)
+                    self.market_regime = current_regime
+                    
+                    logger.info(f"✅ HMM Retraining Complete. Current Regime: {current_regime}")
+                    await broadcast_log(f"🔄 Market Regime Updated: {current_regime}")
+                else:
+                     logger.warning("HMM Retrain: Insufficient data for BTCUSDT")
+            except Exception as e:
+                logger.error(f"HMM Retrain Failed: {e}")
             
             if self.hmm_detector:
                 logger.info("🧠 HMM Model Retrain başlıyor (Thread)...")

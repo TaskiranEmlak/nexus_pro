@@ -191,21 +191,29 @@ class SignalGenerator:
         strength = analysis['strength'] 
         z_score = analysis.get('z_score', 0)
         
-        # 3. TRANSFORMER TEYİDİ (Eğer Trending ise)
+        # 3. TRANSFORMER TEYİDİ (GOD MODE: Her zaman aktif)
         transformer_score = 0
         predicted_price = 0.0
         
-        if self.transformer_active and market_trend == "TRENDING":
+        if self.transformer_active:
+            # Son 20 mum yerine daha fazla veri gerekebilir ama hız için 20 iyi
             recent_candles = df['close'].tail(20).tolist()
             predicted_price = self.transformer.predict(recent_candles)
             
-            # Tahmin Teyidi
-            if direction == "BUY" and predicted_price > current_price * 1.0005: 
-                transformer_score = 0.2
-                analysis['reason'] += f" | AI Pred: {predicted_price:.2f}"
-            elif direction == "SELL" and predicted_price < current_price * 0.9995:
-                transformer_score = 0.2
-                analysis['reason'] += f" | AI Pred: {predicted_price:.2f}"
+            # Sinyal Yönü ile Tahmin Yönü Uyuşuyor mu?
+            # BUY Sinyali + Fiyat Artacak Tahmini = STRONG BUY
+            if direction == "BUY" and predicted_price > current_price * 1.0002: # %0.02 artış beklentisi
+                transformer_score = 0.3 # Güçlü Teyit
+                analysis['reason'] += f" | AI: 🚀 {predicted_price:.2f}"
+            
+            # SELL Sinyali + Fiyat Düşecek Tahmini = STRONG SELL
+            elif direction == "SELL" and predicted_price < current_price * 0.9998: # %0.02 düşüş beklentisi
+                transformer_score = 0.3 # Güçlü Teyit
+                analysis['reason'] += f" | AI: 📉 {predicted_price:.2f}"
+            else:
+                # Yön uyuşmazlığı varsa sinyali zayıflat
+                transformer_score = -0.1
+                analysis['reason'] += " | AI: ⛔ Divergence"
                 
         # Toplam Güç
         total_strength = strength + transformer_score
