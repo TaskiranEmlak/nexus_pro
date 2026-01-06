@@ -189,34 +189,42 @@ class NexusPro:
             
             # 4. İşlem İcra (Execution)
             if signal and signal.signal_type != SignalType.NONE:
-                # Logla
-                logger.info(f"⚡ HFT SIGNAL: {symbol} {signal.signal_type.value} Conf:{signal.confidence:.2f}")
-                await broadcast_log(f"⚡ SIGNAL: {symbol} {signal.signal_type.value} ({signal.reasoning})")
-                
-                # Pozisyon Büyüklüğü
+                direction = signal.signal_type.value
                 ticker_price = signal.entry_price
+                
+                # Logla
+                logger.info(f"⚡ HFT SIGNAL: {symbol} {direction} Conf:{signal.confidence:.2f}")
+                await broadcast_log(f"⚡ SIGNAL: {symbol} {direction} ({signal.reasoning})")
+                
+                # Pozisyon Büyüklüğü (Sabit risk yerine dinamik hesap)
+                # Not: calculate_position_size bakiyeye göre miktar hesaplamalı
                 quantity = self.risk_manager.calculate_position_size(1000, ticker_price, signal.stop_loss)
                 
-                # Market Emri Gönder
+                # EXECUTION: Smart Limit Chase
                 if self.order_executor and not self.order_executor.simulation_mode:
-                    await self.order_executor.place_market_order(symbol, signal.signal_type.value, quantity)
+                    # Callback: StreamManager'dan anlık en iyi fiyatı al (Maker)
+                    price_cb = lambda s, sd: self.stream_manager.get_best_price(s, sd)
+                    
+                    # Chase emrini başlat (Await ederek emrin girmesini garantile)
+                    # HFT için bile olsa emir girmeden pozisyon açılmaz.
+                    await self.order_executor.place_maker_order_with_chase(
+                         symbol=symbol, 
+                         side=direction, 
+                         quantity=quantity, 
+                         price_provider_callback=price_cb
+                    )
                 
-                # Risk Takibi Başlat
+                # Risk Takibi Başlat (DB Kaydı)
                 self.risk_manager.open_position(
                     symbol=symbol,
-                    direction=signal.signal_type.value,
-                    entry_price=ticker_price,
+                    direction=direction,
+                    entry_price=ticker_price, # Yaklaşık giriş fiyatı
                     quantity=quantity,
                     stop_loss=signal.stop_loss,
                     take_profit=signal.take_profit
                 )
                 
-                # Emir Gönder (MARKET - Hız önemli)
-                if self.order_executor and not self.order_executor.simulation_mode:
-                     await self.order_executor.place_market_order(symbol, direction, quantity)
-                         
-                self.risk_manager.open_position(symbol, direction, best_price, quantity, sl, tp)
-                await broadcast_log(f"⚡ SCALP ENTRY: {symbol} {direction} @ {best_price} (OFI: {ofi:.2f})")
+                await broadcast_log(f"⚡ SCALP ENTRY: {symbol} {direction} @ {ticker_price} (OFI: {ofi:.2f})")
 
     async def _init_session(self):
         """Session başlat"""

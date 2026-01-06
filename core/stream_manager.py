@@ -86,3 +86,29 @@ class StreamManager:
             except Exception as e:
                 # logger.error(f"Stream Error {symbol}: {e}")
                 await asyncio.sleep(5) # Hata durumunda bekle
+
+    def get_best_price(self, symbol: str, side: str) -> Optional[float]:
+        """
+        HFT Chase için güncel en iyi fiyatı (Maker) döndürür.
+        BUY -> Best Bid
+        SELL -> Best Ask
+        """
+        if symbol not in self.orderbooks:
+            return None
+        
+        ob = self.orderbooks[symbol]
+        # Check basic integrity
+        if not ob or 'bids' not in ob or 'asks' not in ob:
+            return None
+            
+        try:
+            if not ob['bids'] or not ob['asks']:
+                return None
+                
+            if side == 'BUY':
+                return float(ob['bids'][0][0])
+            elif side == 'SELL':
+                return float(ob['asks'][0][0])
+        except Exception:
+            return None
+        return None

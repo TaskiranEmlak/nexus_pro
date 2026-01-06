@@ -141,16 +141,24 @@ class SignalGenerator:
         self.signals_today = 0
         self.max_signals = trading_settings.max_signals_per_day if trading_settings else 100
         
-        # Microstructure Module import (Lazy load to avoid circular import if any)
+        # Microstructure Module import
         from .microstructure import MicrostructureAnalyzer
         self.micro_analyzer = MicrostructureAnalyzer()
         
+        # Transformer Model import (The Brain)
+        try:
+            from .transformer_model import TransformerModel
+            self.transformer = TransformerModel()
+            self.transformer_active = True
+        except ImportError:
+            self.transformer_active = False
+
     def generate_signal(
         self, 
         symbol: str, 
         df: pd.DataFrame,
         market_trend: str = "SIDEWAYS",
-        orderbook: Dict = None # YENİ: Order Book datası şart
+        orderbook: Dict = None 
     ) -> Optional[Signal]:
         """
         HFT Sinyal Üret
@@ -159,22 +167,19 @@ class SignalGenerator:
             return None
             
         # 1. HMM REJİM KONTROLÜ
-        # Volatil piyasada Scalping tehlikelidir (Slippage artar)
         if market_trend == "VOLATILE":
-            # logger.info(f"Market is VOLATILE for {symbol}. Blocking scalp.")
             return None
 
-        # 2. MICROSTRUCTURE ANALİZİ (Order Book yoksa işlem yok)
+        # 2. MICROSTRUCTURE ANALİZİ
         if not orderbook:
             return None
             
         latest = df.iloc[-1]
         
-        # OFI Hesapla (-1.0 ile 1.0 arası)
+        # OFI Hesapla (Stateful)
         ofi = self.micro_analyzer.calculate_ofi(orderbook)
         
-        # VWAP Hesapla (Basit yaklaşım: son 20 mumun VWAP'ı)
-        # Gerçek HFT'de tick-by-tick hesaplanır ama burada mum verisinden approx.
+        # VWAP Hesapla
         vwap = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
         current_vwap = vwap.iloc[-1]
         current_price = latest['close']
@@ -182,19 +187,38 @@ class SignalGenerator:
         # Sinyal Gücünü Ölç
         analysis = self.micro_analyzer.get_signal_strength(ofi, current_price, current_vwap)
         
-        direction = analysis['direction'] # 'BUY', 'SELL', 'NEUTRAL'
-        strength = analysis['strength']   # 0.0 - 1.0
+        direction = analysis['direction'] 
+        strength = analysis['strength'] 
+        z_score = analysis.get('z_score', 0)
         
-        # 3. KARAR MEKANİZMASI
-        # OFI eşiği: 0.3 (Mikro yapıda belirgin dengesizlik)
-        # Güç eşiği: 0.6 (Yüksek güven)
+        # 3. TRANSFORMER TEYİDİ (Eğer Trending ise)
+        transformer_score = 0
+        predicted_price = 0.0
         
+        if self.transformer_active and market_trend == "TRENDING":
+            recent_candles = df['close'].tail(20).tolist()
+            predicted_price = self.transformer.predict(recent_candles)
+            
+            # Tahmin Teyidi
+            if direction == "BUY" and predicted_price > current_price * 1.0005: 
+                transformer_score = 0.2
+                analysis['reason'] += f" | AI Pred: {predicted_price:.2f}"
+            elif direction == "SELL" and predicted_price < current_price * 0.9995:
+                transformer_score = 0.2
+                analysis['reason'] += f" | AI Pred: {predicted_price:.2f}"
+                
+        # Toplam Güç
+        total_strength = strength + transformer_score
+        
+        # Eşik Değerleri (Sigma tabanlı olduğu için daha yüksek olabilir)
         threshold_strength = 0.6
         
-        if direction == "NEUTRAL" or strength < threshold_strength:
+        if direction == "NEUTRAL" or total_strength < threshold_strength:
             return None
             
         signal_type = SignalType.BUY if direction == "BUY" else SignalType.SELL
+        
+        # ... (rest of the logic)
         
         # 4. HEDEFLER (Scalping için dar hedefler)
         atr = latest.get('atr_14', current_price * 0.005)
