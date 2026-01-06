@@ -129,153 +129,110 @@ class TechnicalAnalyzer:
 
 class SignalGenerator:
     """
-    Sinyal üretici
+    HFT Sinyal Üretici (OFI + VWAP + HMM)
     
-    Mantık:
-    1. Teknik göstergeleri hesapla
-    2. RSI + MACD + Stochastic kombinasyonu ile sinyal oluştur
-    3. Trend filtresi uygula
+    YENİ MANTIK (GOD MODE):
+    1. Mikro Yapı Analizi (Order Flow Imbalance - OFI)
+    2. HMM Rejim Filtresi (Volatilite koruması)
+    3. VWAP Sapması (Fiyatın adil değere göre konumu)
     """
     
     def __init__(self, trading_settings=None):
         self.signals_today = 0
         self.max_signals = trading_settings.max_signals_per_day if trading_settings else 100
         
+        # Microstructure Module import (Lazy load to avoid circular import if any)
+        from .microstructure import MicrostructureAnalyzer
+        self.micro_analyzer = MicrostructureAnalyzer()
+        
     def generate_signal(
         self, 
         symbol: str, 
         df: pd.DataFrame,
-        market_trend: str = "SIDEWAYS"
+        market_trend: str = "SIDEWAYS",
+        orderbook: Dict = None # YENİ: Order Book datası şart
     ) -> Optional[Signal]:
         """
-        Sinyal üret
-        
-        Args:
-            symbol: Trading sembolü
-            df: OHLCV DataFrame (göstergeler hesaplanmış)
-            market_trend: Piyasa rejimi
-            
-        Returns:
-            Signal veya None
+        HFT Sinyal Üret
         """
         if df is None or len(df) < 50:
             return None
             
-        # FIX: Repainting prevention - Use closed candles
-        # iloc[-1] is the current (forming) candle. 
-        # iloc[-2] is the last completed candle.
-        latest = df.iloc[-2] 
-        prev = df.iloc[-3]
-        
-        # Volatile regime check - STAY CASH
+        # 1. HMM REJİM KONTROLÜ
+        # Volatil piyasada Scalping tehlikelidir (Slippage artar)
         if market_trend == "VOLATILE":
-            logger.info(f"Market is VOLATILE for {symbol}. Staying in cash.")
+            # logger.info(f"Market is VOLATILE for {symbol}. Blocking scalp.")
             return None
 
-        features = self._extract_features(latest)
-        
-        # Sinyal tespiti
-        signal_type = self._detect_signal(latest, prev, market_trend)
-        
-        if signal_type == SignalType.NONE:
+        # 2. MICROSTRUCTURE ANALİZİ (Order Book yoksa işlem yok)
+        if not orderbook:
             return None
             
-        # Entry, SL, TP hesapla
-        entry_price = float(latest['close'])
-        atr = float(latest.get('atr_14', entry_price * 0.01))
+        latest = df.iloc[-1]
+        
+        # OFI Hesapla (-1.0 ile 1.0 arası)
+        ofi = self.micro_analyzer.calculate_ofi(orderbook)
+        
+        # VWAP Hesapla (Basit yaklaşım: son 20 mumun VWAP'ı)
+        # Gerçek HFT'de tick-by-tick hesaplanır ama burada mum verisinden approx.
+        vwap = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
+        current_vwap = vwap.iloc[-1]
+        current_price = latest['close']
+        
+        # Sinyal Gücünü Ölç
+        analysis = self.micro_analyzer.get_signal_strength(ofi, current_price, current_vwap)
+        
+        direction = analysis['direction'] # 'BUY', 'SELL', 'NEUTRAL'
+        strength = analysis['strength']   # 0.0 - 1.0
+        
+        # 3. KARAR MEKANİZMASI
+        # OFI eşiği: 0.3 (Mikro yapıda belirgin dengesizlik)
+        # Güç eşiği: 0.6 (Yüksek güven)
+        
+        threshold_strength = 0.6
+        
+        if direction == "NEUTRAL" or strength < threshold_strength:
+            return None
+            
+        signal_type = SignalType.BUY if direction == "BUY" else SignalType.SELL
+        
+        # 4. HEDEFLER (Scalping için dar hedefler)
+        atr = latest.get('atr_14', current_price * 0.005)
         
         if signal_type == SignalType.BUY:
-            stop_loss = entry_price - (atr * 1.5)
-            take_profit = entry_price + (atr * 3.0)  # 2:1 R/R
+            stop_loss = current_price - (atr * 0.8)  # Çok dar SL
+            take_profit = current_price + (atr * 1.5) # 1.5R - 2R
         else:
-            stop_loss = entry_price + (atr * 1.5)
-            take_profit = entry_price - (atr * 3.0)
-            
-        # Base confidence (daha sonra ConfidenceScorer detaylandıracak)
-        confidence = self._calculate_base_confidence(latest, signal_type)
+            stop_loss = current_price + (atr * 0.8)
+            take_profit = current_price - (atr * 1.5)
+
+        features = self._extract_features(latest)
+        features['ofi'] = ofi
+        features['vwap_dist'] = (current_price - current_vwap) / current_vwap * 100
         
-        reasoning = self._build_reasoning(latest, signal_type)
+        reasoning = f"HFT SIGNAL | {analysis['reason']} | OFI: {ofi:.3f}"
+        
+        # Güven Skoru
+        confidence = 0.6 + (strength * 0.3) # 0.6 taban, OFI gücüyle artar
         
         return Signal(
             symbol=symbol,
             signal_type=signal_type,
             confidence=confidence,
-            entry_price=entry_price,
+            entry_price=current_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
             features=features,
             reasoning=reasoning,
             timestamp=int(latest.get('timestamp', 0))
         )
-        
-    def _detect_signal(self, latest: pd.Series, prev: pd.Series, market_trend: str) -> SignalType:
-        """Sinyal tipi tespit et"""
-        rsi = latest.get('rsi_14', 50)
-        macd_hist = latest.get('macd_hist', 0)
-        prev_macd_hist = prev.get('macd_hist', 0)
-        stoch_k = latest.get('stoch_k', 50)
-        stoch_d = latest.get('stoch_d', 50)
-        
-        buy_score = 0
-        sell_score = 0
-        
-        # ==========================================
-        # 1. SIDEWAYS REGIME (Yatay Piyasa)
-        # Strateji: Mean Reversion (RSI 30-70)
-        # ==========================================
-        if market_trend == "SIDEWAYS":
-            # Strict RSI limits for Sideways
-            if rsi < 30:
-                buy_score += 3 # Strong signal
-            elif rsi > 70:
-                sell_score += 3
-            
-            # Support with Stoch
-            if stoch_k < 20 and stoch_k > stoch_d:
-                buy_score += 1
-            elif stoch_k > 80 and stoch_k < stoch_d:
-                sell_score += 1
 
-        # ==========================================
-        # 2. TRENDING REGIME (Trend Piyasası)
-        # Strateji: Trend Following (MACD, EMA)
-        # RSI limits ignored (allow buy at 40-50 if trend is strong)
-        # ==========================================
-        elif market_trend == "TRENDING":
-            # MACD Crossover is king here
-            if macd_hist > 0 and prev_macd_hist <= 0:
-                buy_score += 3
-            elif macd_hist < 0 and prev_macd_hist >= 0:
-                sell_score += 3
-            elif macd_hist > 0:
-                buy_score += 1
-            elif macd_hist < 0:
-                sell_score += 1
-                
-            # Buy the dip logic
-            # e.g. Price above EMA50 but RSI dipped to 40
-            if rsi < 45 and macd_hist > 0: 
-               buy_score += 1
-               
-        # ==========================================
-        # 3. GENERIC / FALLBACK
-        # ==========================================
-        else:
-            # Default logic if no regime detected (shouldn't happen often)
-            if rsi < 35: buy_score += 2
-            elif rsi > 65: sell_score += 2
-            
-        # Minimum Score Threshold
-        threshold = 3 
-        
-        if buy_score >= threshold and buy_score > sell_score:
-            return SignalType.BUY
-        elif sell_score >= threshold and sell_score > buy_score:
-            return SignalType.SELL
-            
+    # _detect_signal artık kullanılmıyor (Legacy)
+    def _detect_signal(self, latest: pd.Series, prev: pd.Series, market_trend: str) -> SignalType:
         return SignalType.NONE
-        
+
     def _calculate_base_confidence(self, latest: pd.Series, signal_type: SignalType) -> float:
+        return 0.5
         """Base confidence hesapla (0.0 - 1.0)"""
         confidence = 0.5  # Başlangıç
         

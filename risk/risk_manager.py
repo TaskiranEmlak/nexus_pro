@@ -82,6 +82,8 @@ class RiskManager:
         """SQLite veritabanını başlat"""
         try:
             self.conn = sqlite3.connect('risk.db', check_same_thread=False)
+            # Performance Optimization: WAL Mode
+            self.conn.execute("PRAGMA journal_mode=WAL;")
             self.cursor = self.conn.cursor()
             
             # Daily Stats Table

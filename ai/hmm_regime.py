@@ -17,7 +17,7 @@ from utils import get_logger
 
 logger = get_logger("ai_hmm")
 
-class HammMarketRegime:
+class HmmMarketRegime:
     """
     Gaussian Hidden Markov Model kullanarak piyasa rejimini analiz eder.
     Gizli durumlar (States):

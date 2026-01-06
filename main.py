@@ -17,24 +17,21 @@ from config import settings, load_settings_from_env
 from core import DataProvider
 from core.stream_manager import StreamManager
 from ai.microstructure import MicrostructureAnalyzer
+from api import app, broadcast_signal, broadcast_stats, broadcast_log, broadcast_ofi
+import uvicorn
+
 from ai import (
     SignalGenerator, 
     TechnicalAnalyzer,
     ConfidenceScorer,
-    MarketRegimeDetector,
+    HmmMarketRegime,
+    RLAgent,
     SignalType
 )
-# Try optimized HMM
-try:
-    from ai.hmm_regime import HammMarketRegime
-    HMM_AVAILABLE = True
-except ImportError:
-    HMM_AVAILABLE = False
+# Re-import explicit RLAgent if previous alias fails logic
+from ai.rl_agent import RLAgent
 from risk import RiskManager
 from core.order_executor import OrderExecutor
-from ai.rl_agent import RLAgent
-from api import app, broadcast_signal, broadcast_stats, broadcast_log
-import uvicorn
 
 # Logging setup
 logging.basicConfig(
@@ -47,13 +44,6 @@ logger = logging.getLogger("nexus_pro")
 class NexusPro:
     """
     NEXUS PRO Trading Bot
-    
-    Ana bileşenler:
-    - DataProvider: Gerçek zamanlı veri
-    - SignalGenerator: Teknik analiz + sinyal üretimi
-    - ConfidenceScorer: Multi-indicator güven puanlama
-    - MarketRegimeDetector: Bull/Bear/Sideways tespiti
-    - RiskManager: Pozisyon + risk yönetimi
     """
     
     def __init__(self):
@@ -63,14 +53,17 @@ class NexusPro:
         self.data_provider = DataProvider()
         self.signal_generator = SignalGenerator(settings.trading)
         self.confidence_scorer = ConfidenceScorer()
+        # MarketRegimeDetector (Legacy)
+        from ai import MarketRegimeDetector 
         self.regime_detector = MarketRegimeDetector()
         
         # HMM Initialization
-        self.hmm_detector = HammMarketRegime() if HMM_AVAILABLE else None
-        if HMM_AVAILABLE:
+        try:
+            self.hmm_detector = HmmMarketRegime()
             logger.info("🧠 HMM AI Engine Active")
-        else:
-            logger.warning("⚠️ HMM not available (install hmmlearn). Using Rule-based.")
+        except Exception as e:
+            logger.error(f"⚠️ HMM Init Failed: {e}")
+            self.hmm_detector = None
             
         self.risk_manager = RiskManager(settings.risk)
         
@@ -80,7 +73,6 @@ class NexusPro:
             api_secret=settings.exchange.api_secret,
             testnet=settings.exchange.testnet
         )
-        # Connect explicitly later or lazy load
         
         # RL Agent
         self.rl_agent = RLAgent()
@@ -163,100 +155,61 @@ class NexusPro:
             
     async def on_l2_update(self, symbol: str, data_type: str, data: dict):
         """HFT Veri Akışı Handler (L2 OrderBook)"""
-        # HFT aktif değilse işlem yapma
         if not settings.trading.hft_enabled:
             return
             
         if data_type == "ORDER_BOOK":
-            # 1. HMM Kontrolü (HFT sadece Trending'de veya belirli rejimde çalışsın)
-            # Rejim verisi mum kapanışlarında güncelleniyor, hafızadan çekelim
-            # Şimdilik basitleştirilmiş: OFI sinyali çok güçlüyse gir.
-            
-            # 2. OFI Hesapla
+            # 1. Hızlı OFI Hesaplama & Broadcast (Dashboard için)
             ofi = self.micro_analyzer.calculate_ofi(data)
+            await broadcast_ofi(symbol, ofi)
             
-            # 3. Pozisyon Kontrolü (Zaten açıksa ekleme yapma - Scalping modu)
+            # 2. Açık Pozisyon Yönetimi (Scalp Exit)
             if symbol in self.risk_manager.open_positions:
-                # Çıkış sinyali mi? (Ters OFI)
                 pos = self.risk_manager.open_positions[symbol]
-                if (pos.direction == "BUY" and ofi < -0.6) or (pos.direction == "SELL" and ofi > 0.6):
-                     # Erken çıkış (Scalp Take Profit/Stop)
+                # OFI Reversal Exit Logic
+                if (pos.direction == "BUY" and ofi < -0.4) or (pos.direction == "SELL" and ofi > 0.4):
                      ticker = self.data_provider.get_ticker(symbol)
                      if ticker:
                          await self.close_trade(symbol, pos, ticker['price'], "OFI_REVERSAL")
                 return
 
-            # 4. Giriş Sinyali (Eşik: 0.4)
-            threshold = settings.trading.ofi_threshold
-            
-            if abs(ofi) > threshold:
-                direction = "BUY" if ofi > 0 else "SELL"
-                
-                # Fiyatı al (Market emri için yaklaşık fiyat)
-                # Emir defterinden en iyi fiyatı çekebiliriz
-                best_price = data['asks'][0][0] if direction == "BUY" else data['bids'][0][0]
-                
-                logger.info(f"⚡ HFT SIGNAL: {symbol} OFI: {ofi:.2f} -> {direction}")
-                
-                # Scalp Pozisyonu Aç
-                quantity = self.risk_manager.calculate_position_size(1000, best_price, best_price*0.99) # Basit size
-                
-                # Emir Gönder (MARKET - Hız önemli)
-                if self.order_executor:
-                    order = await self.order_executor.place_market_order(symbol, direction, quantity)
-                    if order:
-                         # Risk Manager'a kaydet (Hızlı SL/TP ile)
-                         sl_pct = 0.003 # %0.3 SL (Çok dar)
-                         tp_pct = 0.005 # %0.5 TP
-                         
-                         sl = best_price * (1 - sl_pct) if direction == "BUY" else best_price * (1 + sl_pct)
-                         tp = best_price * (1 + tp_pct) if direction == "BUY" else best_price * (1 - tp_pct)
-                         
-                         self.risk_manager.open_position(symbol, direction, best_price, quantity, sl, tp)
-                         await broadcast_log(f"⚡ SCALP ENTRY: {symbol} {direction} @ {best_price}")
-
-
-    async def on_l2_update(self, symbol: str, data_type: str, data: dict):
-        """HFT Veri Akışı Handler (L2 OrderBook)"""
-        # HFT aktif değilse işlem yapma
-        if not settings.trading.hft_enabled:
-            return
-            
-        if data_type == "ORDER_BOOK":
-            # OFI Hesapla
-            ofi = self.micro_analyzer.calculate_ofi(data)
-            
-            # 3. Pozisyon Kontrolü (Zaten açıksa ekleme yapma - Scalping modu)
-            if symbol in self.risk_manager.open_positions:
-                # Çıkış sinyali mi? (Ters OFI)
-                pos = self.risk_manager.open_positions[symbol]
-                if (pos.direction == "BUY" and ofi < -0.6) or (pos.direction == "SELL" and ofi > 0.6):
-                     # Erken çıkış (Scalp Take Profit/Stop)
-                     ticker = self.data_provider.get_ticker(symbol)
-                     if ticker:
-                         await self.close_trade(symbol, pos, ticker['price'], "OFI_REVERSAL")
+            # 3. YENİ SİNYAL JENERATÖRÜ (OFI + VWAP + HMM)
+            # Mum verisini çek (Analiz için gerekli)
+            df = self.data_provider.get_klines(symbol, settings.trading.primary_timeframe)
+            if df is None:
                 return
 
-            # 4. Giriş Sinyali (Eşik: 0.4)
-            threshold = settings.trading.ofi_threshold
+            # Sinyal Üret
+            signal = self.signal_generator.generate_signal(
+                symbol=symbol,
+                df=df,
+                market_trend=self.market_regime, # HMM Sonucu
+                orderbook=data # L2 OrderBook
+            )
             
-            if abs(ofi) > threshold:
-                direction = "BUY" if ofi > 0 else "SELL"
+            # 4. İşlem İcra (Execution)
+            if signal and signal.signal_type != SignalType.NONE:
+                # Logla
+                logger.info(f"⚡ HFT SIGNAL: {symbol} {signal.signal_type.value} Conf:{signal.confidence:.2f}")
+                await broadcast_log(f"⚡ SIGNAL: {symbol} {signal.signal_type.value} ({signal.reasoning})")
                 
-                # Fiyatı al (Market emri için yaklaşık fiyat)
-                best_price = data['asks'][0][0] if direction == "BUY" else data['bids'][0][0]
+                # Pozisyon Büyüklüğü
+                ticker_price = signal.entry_price
+                quantity = self.risk_manager.calculate_position_size(1000, ticker_price, signal.stop_loss)
                 
-                logger.debug(f"⚡ HFT SIGNAL: {symbol} OFI: {ofi:.2f} -> {direction}")
+                # Market Emri Gönder
+                if self.order_executor and not self.order_executor.simulation_mode:
+                    await self.order_executor.place_market_order(symbol, signal.signal_type.value, quantity)
                 
-                # Scalp Pozisyonu Aç
-                quantity = self.risk_manager.calculate_position_size(1000, best_price, best_price*0.99) # Basit size
-                
-                # Risk Manager'a kaydet (Hızlı SL/TP ile)
-                sl_pct = 0.003 # %0.3 SL (Çok dar)
-                tp_pct = 0.005 # %0.5 TP
-                
-                sl = best_price * (1 - sl_pct) if direction == "BUY" else best_price * (1 + sl_pct)
-                tp = best_price * (1 + tp_pct) if direction == "BUY" else best_price * (1 - tp_pct)
+                # Risk Takibi Başlat
+                self.risk_manager.open_position(
+                    symbol=symbol,
+                    direction=signal.signal_type.value,
+                    entry_price=ticker_price,
+                    quantity=quantity,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit
+                )
                 
                 # Emir Gönder (MARKET - Hız önemli)
                 if self.order_executor and not self.order_executor.simulation_mode:
@@ -311,13 +264,21 @@ class NexusPro:
         while self._running:
             await asyncio.sleep(retrain_interval)
             
+    async def _hmm_retrain_loop(self):
+        """HMM Modelini periyodik olarak yeniden eğit (Thread-Safe)"""
+        retrain_interval = 6 * 60 * 60  # 6 saat
+        
+        while self._running:
+            await asyncio.sleep(retrain_interval)
+            
             if self.hmm_detector:
-                logger.info("🧠 HMM Model Retrain başlıyor...")
+                logger.info("🧠 HMM Model Retrain başlıyor (Thread)...")
                 try:
                     # BTC verisini çek ve modeli yeniden eğit
                     btc_data = self.data_provider.get_klines("BTCUSDT", "1h")
                     if btc_data is not None and len(btc_data) > 100:
-                        self.hmm_detector.train(btc_data)
+                        # Ağır işlemi thread'e atarak event loop'u kilitlemesini önle
+                        await asyncio.to_thread(self.hmm_detector.train, btc_data)
                         logger.info("✅ HMM Model yeniden eğitildi!")
                 except Exception as e:
                     logger.error(f"HMM Retrain hatası: {e}")
