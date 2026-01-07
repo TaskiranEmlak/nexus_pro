@@ -1,15 +1,16 @@
 # ============================================================
-# NEXUS PRO - Risk Manager
+# NEXUS PRO - Risk Manager (Async)
 # ============================================================
 # Pozisyon boyutlandırma, SL/TP, Drawdown koruma
+# AIOSQLITE ile asenkron veritabanı işlemleri
 # ============================================================
 
 import logging
+import aiosqlite
+import asyncio
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, date
-import sqlite3
-import json # Kept for potential secondary usage or removing later if fully replaced
 import os
 
 logger = logging.getLogger("nexus_pro.risk")
@@ -39,13 +40,14 @@ class DailyStats:
 
 class RiskManager:
     """
-    Risk Yönetimi
+    Risk Yönetimi (Async)
     
     Özellikler:
     - Dinamik pozisyon boyutlandırma
     - ATR bazlı SL/TP
     - Günlük drawdown limiti
     - Max açık pozisyon limiti
+    - Non-blocking async DB işlemleri
     """
     
     def __init__(
@@ -75,19 +77,23 @@ class RiskManager:
         self.daily_stats = DailyStats(date=str(date.today()))
         self.is_paused = False
         
-        self._init_db()
-        self._load_state()
+        # Async DB connection (initialized later)
+        self.conn: Optional[aiosqlite.Connection] = None
+        self._db_lock = asyncio.Lock()
+        self._initialized = False
         
-    def _init_db(self):
-        """SQLite veritabanını başlat"""
+    async def init_db(self):
+        """Async SQLite veritabanını başlat"""
+        if self._initialized:
+            return
+            
         try:
-            self.conn = sqlite3.connect('risk.db', check_same_thread=False)
+            self.conn = await aiosqlite.connect('risk.db')
             # Performance Optimization: WAL Mode
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-            self.cursor = self.conn.cursor()
+            await self.conn.execute("PRAGMA journal_mode=WAL;")
             
             # Daily Stats Table
-            self.cursor.execute('''
+            await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS daily_stats (
                     date TEXT PRIMARY KEY,
                     total_trades INTEGER,
@@ -101,7 +107,7 @@ class RiskManager:
             ''')
             
             # Open Positions Table
-            self.cursor.execute('''
+            await self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS open_positions (
                     symbol TEXT PRIMARY KEY,
                     direction TEXT,
@@ -113,96 +119,106 @@ class RiskManager:
                     pnl REAL
                 )
             ''')
-            self.conn.commit()
+            await self.conn.commit()
+            self._initialized = True
+            logger.info("✅ Async DB (aiosqlite) initialized")
+            
+            # Load existing state
+            await self.load_state()
+            
         except Exception as e:
             logger.error(f"DB Init Failed: {e}")
 
-    def _save_state(self):
-        """Durumu SQLite'a kaydet"""
-        try:
-            # 1. Save Daily Stats
-            ds = self.daily_stats
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO daily_stats 
-                (date, total_trades, wins, losses, total_pnl, max_drawdown, current_drawdown, is_paused)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                ds.date, ds.total_trades, ds.wins, ds.losses, 
-                ds.total_pnl, ds.max_drawdown, ds.current_drawdown, 
-                1 if self.is_paused else 0
-            ))
+    async def save_state(self):
+        """Durumu SQLite'a kaydet (Async)"""
+        if not self.conn:
+            return
             
-            # 2. Sync Positions (Basit yöntem: Hepsini silip yeniden ekle veya tek tek upsert)
-            # Burada tek tek DELETE + INSERT yapıyorum temizlik için
-            self.cursor.execute("DELETE FROM open_positions")
-            
-            for symbol, pos in self.open_positions.items():
-                self.cursor.execute('''
-                    INSERT INTO open_positions 
-                    (symbol, direction, entry_price, quantity, stop_loss, take_profit, entry_time, pnl)
+        async with self._db_lock:
+            try:
+                # 1. Save Daily Stats
+                ds = self.daily_stats
+                await self.conn.execute('''
+                    INSERT OR REPLACE INTO daily_stats 
+                    (date, total_trades, wins, losses, total_pnl, max_drawdown, current_drawdown, is_paused)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    pos.symbol, pos.direction, pos.entry_price, pos.quantity,
-                    pos.stop_loss, pos.take_profit, pos.entry_time.isoformat(),
-                    pos.pnl
+                    ds.date, ds.total_trades, ds.wins, ds.losses, 
+                    ds.total_pnl, ds.max_drawdown, ds.current_drawdown, 
+                    1 if self.is_paused else 0
                 ))
                 
-            self.conn.commit()
+                # 2. Sync Positions (Hepsini silip yeniden ekle)
+                await self.conn.execute("DELETE FROM open_positions")
+                
+                for symbol, pos in self.open_positions.items():
+                    await self.conn.execute('''
+                        INSERT INTO open_positions 
+                        (symbol, direction, entry_price, quantity, stop_loss, take_profit, entry_time, pnl)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        pos.symbol, pos.direction, pos.entry_price, pos.quantity,
+                        pos.stop_loss, pos.take_profit, pos.entry_time.isoformat(),
+                        pos.pnl
+                    ))
+                    
+                await self.conn.commit()
+                
+            except Exception as e:
+                logger.error(f"State kaydetme hatası (SQLite): {e}")
             
-        except Exception as e:
-            logger.error(f"State kaydetme hatası (SQLite): {e}")
-            
-    def _load_state(self):
-        """Durumu SQLite'dan yükle"""
-        if not hasattr(self, 'cursor'):
-             return
+    async def load_state(self):
+        """Durumu SQLite'dan yükle (Async)"""
+        if not self.conn:
+            return
 
-        try:
-            today_str = str(date.today())
-            
-            # 1. Load Daily Stats
-            self.cursor.execute("SELECT * FROM daily_stats WHERE date=?", (today_str,))
-            row = self.cursor.fetchone()
-            
-            if row:
-                # Row order matches CREATE TABLE
-                self.daily_stats = DailyStats(
-                    date=row[0],
-                    total_trades=row[1],
-                    wins=row[2],
-                    losses=row[3],
-                    total_pnl=row[4],
-                    max_drawdown=row[5],
-                    current_drawdown=row[6]
-                )
-                self.is_paused = bool(row[7])
-            else:
-                # No record for today, start fresh
-                self.daily_stats = DailyStats(date=today_str)
+        async with self._db_lock:
+            try:
+                today_str = str(date.today())
                 
-            # 2. Load Open Positions
-            self.cursor.execute("SELECT * FROM open_positions")
-            rows = self.cursor.fetchall()
-            
-            self.open_positions = {}
-            for r in rows:
-                # symbol, direction, entry_price, quantity, stop_loss, take_profit, entry_time, pnl
-                pos = Position(
-                    symbol=r[0],
-                    direction=r[1],
-                    entry_price=r[2],
-                    quantity=r[3],
-                    stop_loss=r[4],
-                    take_profit=r[5],
-                    entry_time=datetime.fromisoformat(r[6]),
-                    pnl=r[7]
-                )
-                self.open_positions[pos.symbol] = pos
+                # 1. Load Daily Stats
+                async with self.conn.execute("SELECT * FROM daily_stats WHERE date=?", (today_str,)) as cursor:
+                    row = await cursor.fetchone()
                 
-            logger.info(f"Loaded {len(self.open_positions)} open positions from DB.")
+                if row:
+                    # Row order matches CREATE TABLE
+                    self.daily_stats = DailyStats(
+                        date=row[0],
+                        total_trades=row[1],
+                        wins=row[2],
+                        losses=row[3],
+                        total_pnl=row[4],
+                        max_drawdown=row[5],
+                        current_drawdown=row[6]
+                    )
+                    self.is_paused = bool(row[7])
+                else:
+                    # No record for today, start fresh
+                    self.daily_stats = DailyStats(date=today_str)
+                    
+                # 2. Load Open Positions
+                async with self.conn.execute("SELECT * FROM open_positions") as cursor:
+                    rows = await cursor.fetchall()
                 
-        except Exception as e:
-            logger.error(f"State yükleme hatası (SQLite): {e}")
+                self.open_positions = {}
+                for r in rows:
+                    # symbol, direction, entry_price, quantity, stop_loss, take_profit, entry_time, pnl
+                    pos = Position(
+                        symbol=r[0],
+                        direction=r[1],
+                        entry_price=r[2],
+                        quantity=r[3],
+                        stop_loss=r[4],
+                        take_profit=r[5],
+                        entry_time=datetime.fromisoformat(r[6]),
+                        pnl=r[7]
+                    )
+                    self.open_positions[pos.symbol] = pos
+                    
+                logger.info(f"Loaded {len(self.open_positions)} open positions from DB.")
+                    
+            except Exception as e:
+                logger.error(f"State yükleme hatası (SQLite): {e}")
 
     def calculate_sl_tp(self, entry_price: float, direction: str, atr: float, atr_multiplier: float = 1.5) -> Tuple[float, float]:
         """ATR bazlı Stop Loss ve Take Profit hesapla"""
@@ -257,7 +273,7 @@ class RiskManager:
         return True, "OK"
     
     def open_position(self, symbol: str, direction: str, entry_price: float, quantity: float, stop_loss: float, take_profit: float):
-        """Yeni pozisyon aç ve kaydet"""
+        """Yeni pozisyon aç ve kaydet (senkron - async save ayrı çağrılmalı)"""
         pos = Position(
             symbol=symbol,
             direction=direction,
@@ -268,11 +284,16 @@ class RiskManager:
             entry_time=datetime.now()
         )
         self.open_positions[symbol] = pos
-        self._save_state()
+        # Not: save_state() async olduğundan ayrıca çağrılmalı
         logger.info(f"📈 Pozisyon Açıldı: {direction} {symbol} @ {entry_price:.4f}")
         
+    async def open_position_async(self, symbol: str, direction: str, entry_price: float, quantity: float, stop_loss: float, take_profit: float):
+        """Yeni pozisyon aç ve kaydet (async)"""
+        self.open_position(symbol, direction, entry_price, quantity, stop_loss, take_profit)
+        await self.save_state()
+        
     def close_position(self, symbol: str, exit_price: float):
-        """Pozisyonu kapat ve istatistikleri güncelle"""
+        """Pozisyonu kapat ve istatistikleri güncelle (senkron - async save ayrı çağrılmalı)"""
         if symbol not in self.open_positions:
             return
             
@@ -300,8 +321,12 @@ class RiskManager:
                 self.daily_stats.max_drawdown = self.daily_stats.current_drawdown
         
         del self.open_positions[symbol]
-        self._save_state()
         logger.info(f"📉 Pozisyon Kapatıldı: {symbol} PnL: {pnl:.2f}")
+        
+    async def close_position_async(self, symbol: str, exit_price: float):
+        """Pozisyonu kapat ve kaydet (async)"""
+        self.close_position(symbol, exit_price)
+        await self.save_state()
         
     def get_daily_stats(self) -> Dict:
         """Günlük istatistikleri döndür"""
@@ -318,7 +343,9 @@ class RiskManager:
             "is_paused": self.is_paused
         }
 
-    def __del__(self):
-        """Destructor to close connection"""
-        if hasattr(self, 'conn'):
-            self.conn.close()
+    async def close(self):
+        """Async connection'ı kapat"""
+        if self.conn:
+            await self.save_state()  # Son durumu kaydet
+            await self.conn.close()
+            logger.info("📴 RiskManager DB connection closed")

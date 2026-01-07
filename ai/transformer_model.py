@@ -66,21 +66,39 @@ class TransformerModel(nn.Module):
         Returns:
            float: Tahmin edilen sonraki fiyat
         """
-        if not recent_candles:
-            return 0.0
+        if not recent_candles or len(recent_candles) < 3:
+            return recent_candles[-1] if recent_candles else 0.0
             
         try:
-            # Prepare Input Tensor
-            # Liste -> Numpy -> Tensor
-            # Shape: [Batch=1, Seq=N, Feature=1]
-            data_arr = np.array(recent_candles, dtype=np.float32).reshape(1, -1, 1)
+            # --- NORMALIZATION (Percentage Returns) ---
+            # Neural Networks ham fiyatlarla çalışamaz!
+            # Log/Yüzde değişimlerini kullanıyoruz
+            prices = np.array(recent_candles, dtype=np.float32)
+            
+            # Yüzde değişimleri hesapla (ilk eleman kaybolur)
+            returns = np.diff(prices) / prices[:-1]
+            
+            # Çok küçük/büyük değerleri sınırla (numerical stability)
+            returns = np.clip(returns, -0.1, 0.1)
+            
+            # Input Tensor (Normalized)
+            # Shape: [Batch=1, Seq=N-1, Feature=1]
+            data_arr = returns.reshape(1, -1, 1)
             src = torch.from_numpy(data_arr)
             
             # Eval mode
             self.eval()
             with torch.no_grad():
                 pred_tensor = self.forward(src)
-                prediction = pred_tensor.item()
+                # Çıktı: Tahmin edilen bir sonraki periyodun yüzde değişimi
+                predicted_return = pred_tensor.item()
+                
+            # Tahmin edilen dönüşü sınırla
+            predicted_return = np.clip(predicted_return, -0.05, 0.05)
+            
+            # Ham fiyata dönüştür
+            last_price = recent_candles[-1]
+            prediction = last_price * (1 + predicted_return)
                 
             return prediction
             

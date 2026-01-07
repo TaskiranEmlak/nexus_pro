@@ -83,6 +83,10 @@ class NexusPro:
         self.signals_today = 0
         self.symbols: list = []
         self.recent_signals: list = [] # For GUI
+        self.market_regime = "SIDEWAYS"  # HMM sonucu için
+        
+        # Thread Safety Lock for HMM
+        self._hmm_lock = asyncio.Lock()
         
         # Inject self into API
         import api.server
@@ -105,6 +109,9 @@ class NexusPro:
         # Connect to Exchange
         if self.order_executor:
             await self.order_executor.connect()
+        
+        # Initialize Async DB (RiskManager)
+        await self.risk_manager.init_db()
         
         # En volatil sembolleri al
         async with self.data_provider._session or await self._init_session():
@@ -166,14 +173,37 @@ class NexusPro:
             # 2. Açık Pozisyon Yönetimi (Scalp Exit)
             if symbol in self.risk_manager.open_positions:
                 pos = self.risk_manager.open_positions[symbol]
-                # OFI Reversal Exit Logic
-                if (pos.direction == "BUY" and ofi < -0.4) or (pos.direction == "SELL" and ofi > 0.4):
+                
+                # ⚠️ Minimum Tutma Süresi Kontrolü (Whipsaw önleme)
+                hold_time = (datetime.now() - pos.entry_time).total_seconds()
+                min_hold_time = 10  # En az 10 saniye tut
+                
+                if hold_time < min_hold_time:
+                    return  # Henüz çıkış yapma
+                
+                # OFI Reversal Exit Logic (Daha güçlü eşik: 0.6)
+                ofi_exit_threshold = 0.6  # 0.4'ten 0.6'ya yükseltildi
+                
+                if (pos.direction == "BUY" and ofi < -ofi_exit_threshold) or \
+                   (pos.direction == "SELL" and ofi > ofi_exit_threshold):
                      ticker = self.data_provider.get_ticker(symbol)
                      if ticker:
                          await self.close_trade(symbol, pos, ticker['price'], "OFI_REVERSAL")
                 return
 
-            # 3. YENİ SİNYAL JENERATÖRÜ (OFI + VWAP + HMM)
+            # 3. Sinyal Cooldown Kontrolü (Aynı sembole sürekli sinyal önleme)
+            if not hasattr(self, '_signal_cooldowns'):
+                self._signal_cooldowns = {}
+            
+            current_time = datetime.now()
+            cooldown_seconds = 30  # 30 saniye cooldown
+            
+            if symbol in self._signal_cooldowns:
+                time_since_last = (current_time - self._signal_cooldowns[symbol]).total_seconds()
+                if time_since_last < cooldown_seconds:
+                    return  # Cooldown süresi dolmadı
+            
+            # 4. YENİ SİNYAL JENERATÖRÜ (OFI + VWAP + HMM)
             # Mum verisini çek (Analiz için gerekli)
             df = self.data_provider.get_klines(symbol, settings.trading.primary_timeframe)
             if df is None:
@@ -187,18 +217,29 @@ class NexusPro:
                 orderbook=data # L2 OrderBook
             )
             
-            # 4. İşlem İcra (Execution)
+            # 5. İşlem İcra (Execution)
             if signal and signal.signal_type != SignalType.NONE:
                 direction = signal.signal_type.value
                 ticker_price = signal.entry_price
+                
+                # Cooldown kaydı güncelle
+                self._signal_cooldowns[symbol] = current_time
                 
                 # Logla
                 logger.info(f"⚡ HFT SIGNAL: {symbol} {direction} Conf:{signal.confidence:.2f}")
                 await broadcast_log(f"⚡ SIGNAL: {symbol} {direction} ({signal.reasoning})")
                 
-                # Pozisyon Büyüklüğü (Sabit risk yerine dinamik hesap)
-                # Not: calculate_position_size bakiyeye göre miktar hesaplamalı
-                quantity = self.risk_manager.calculate_position_size(1000, ticker_price, signal.stop_loss)
+                # Gerçek Bakiyeyi Çek (HFT Performance için cacheleme düşünülebilir)
+                balance = await self.order_executor.get_balance()
+                available = await self.order_executor.get_available_balance()
+                
+                # Bakiye Kontrolü
+                if balance < 10:  # Minimum bakiye
+                    logger.warning(f"⚠️ Yetersiz bakiye: {balance:.2f} USDT")
+                    return
+                
+                # Pozisyon Büyüklüğü (Gerçek Bakiye Kullanarak)
+                quantity = self.risk_manager.calculate_position_size(balance, ticker_price, signal.stop_loss)
                 
                 # EXECUTION: Smart Limit Chase
                 if self.order_executor and not self.order_executor.simulation_mode:
@@ -279,12 +320,14 @@ class NexusPro:
                 df = await self.data_provider.get_klines("BTCUSDT", "15m", limit=2000)
                 
                 if df is not None and len(df) > 500:
-                    # Blocking işlemi thread'e at
-                    await asyncio.to_thread(self.hmm_regime.train_model, df)
-                    
-                    # Yeni rejimi güncelle
-                    current_regime = self.hmm_regime.predict_regime(df)
-                    self.market_regime = current_regime
+                    # Lock ile thread-safe erişim
+                    async with self._hmm_lock:
+                        # Blocking işlemi thread'e at
+                        await asyncio.to_thread(self.hmm_regime.train_model, df)
+                        
+                        # Yeni rejimi güncelle
+                        current_regime = self.hmm_regime.predict_regime(df)
+                        self.market_regime = current_regime
                     
                     logger.info(f"✅ HMM Retraining Complete. Current Regime: {current_regime}")
                     await broadcast_log(f"🔄 Market Regime Updated: {current_regime}")
@@ -299,8 +342,10 @@ class NexusPro:
                     # BTC verisini çek ve modeli yeniden eğit
                     btc_data = self.data_provider.get_klines("BTCUSDT", "1h")
                     if btc_data is not None and len(btc_data) > 100:
-                        # Ağır işlemi thread'e atarak event loop'u kilitlemesini önle
-                        await asyncio.to_thread(self.hmm_detector.train, btc_data)
+                        # Lock ile thread-safe erişim
+                        async with self._hmm_lock:
+                            # Ağır işlemi thread'e atarak event loop'u kilitlemesini önle
+                            await asyncio.to_thread(self.hmm_detector.train, btc_data)
                         logger.info("✅ HMM Model yeniden eğitildi!")
                 except Exception as e:
                     logger.error(f"HMM Retrain hatası: {e}")
@@ -316,6 +361,9 @@ class NexusPro:
         
         if self.order_executor:
             await self.order_executor.disconnect()
+        
+        # Async DB bağlantısını kapat
+        await self.risk_manager.close()
         
         # Günlük özet
         stats = self.risk_manager.get_daily_stats()
@@ -369,7 +417,9 @@ class NexusPro:
         use_hmm = self.hmm_detector and klines_1h is not None and len(klines_1h) > 100
         
         if use_hmm:
-             hmm_regime, hmm_prob = self.hmm_detector.predict_regime(klines_1h)
+             # Lock ile thread-safe HMM erişimi
+             async with self._hmm_lock:
+                 hmm_regime, hmm_prob = self.hmm_detector.predict_regime(klines_1h)
              # Basic usage: If HMM says SIDEWAYS, warn user
              regime_result = self.regime_detector.detect(latest) # Still use classic for details
              if hmm_regime != "UNKNOWN":
@@ -493,14 +543,30 @@ class NexusPro:
         else:
             sl_price, tp_price = signal.stop_loss, signal.take_profit
             
-        # 2. Pozisyon Büyüklüğü
-        balance = 1000.0 # TODO: Borsa bakiyesini çek (self.order_executor.get_balance)
+        # 2. Pozisyon Büyüklüğü (Gerçek Bakiye)
+        balance = await self.order_executor.get_balance()
+        available = await self.order_executor.get_available_balance()
+        
+        if balance < 10:
+            logger.warning(f"⚠️ Yetersiz bakiye: {balance:.2f} USDT")
+            await broadcast_log(f"WARNING: Insufficient balance ({balance:.2f} USDT)")
+            return
+        
         quantity = self.risk_manager.calculate_position_size(
             account_balance=balance, 
             entry_price=entry_price, 
             stop_loss=sl_price, 
             confidence=confidence
         )
+        
+        # Marjin Kontrolü (Kaldıraç varsayımı: 20x)
+        leverage = 20
+        required_margin = (quantity * entry_price) / leverage
+        
+        if required_margin > available:
+            logger.warning(f"⚠️ Yetersiz marjin! Gerekli: {required_margin:.2f}, Mevcut: {available:.2f}")
+            await broadcast_log(f"WARNING: Insufficient margin (Need: {required_margin:.2f}, Have: {available:.2f})")
+            return
         
         # 3. Emir İletimi (OrderExecutor)
         if self.order_executor:

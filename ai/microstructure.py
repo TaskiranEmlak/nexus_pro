@@ -29,6 +29,17 @@ class MicrostructureAnalyzer:
         self.ofi_history = []
         self.max_history = 100
 
+    def reset(self):
+        """
+        WebSocket yeniden bağlantısında veya sembol değişikliğinde state sıfırla.
+        Bu, yeniden bağlantı sonrası yanlış OFI spike'larını önler.
+        """
+        self.prev_best_bid = None
+        self.prev_best_ask = None
+        self.prev_bid_vol = 0.0
+        self.prev_ask_vol = 0.0
+        self.ofi_history.clear()
+
     def calculate_ofi(self, orderbook: Dict) -> float:
         """
         TRUE OFI (Order Flow Imbalance) Hesapla

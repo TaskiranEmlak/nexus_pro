@@ -245,3 +245,41 @@ class OrderExecutor:
         except Exception as e:
             logger.error(f"Get Orders Failed: {e}")
             return []
+
+    async def get_balance(self, asset: str = "USDT") -> float:
+        """Toplam bakiyeyi çek"""
+        if self.simulation_mode:
+            logger.debug("🧪 [SIMULATION] Returning mock balance: 1000 USDT")
+            return 1000.0  # Simülasyon için varsayılan
+        
+        if not self.client:
+            logger.error("Client not connected!")
+            return 0.0
+        
+        try:
+            account_info = await self.client.futures_account_balance()
+            for item in account_info:
+                if item["asset"] == asset:
+                    return float(item["balance"])
+            return 0.0
+        except Exception as e:
+            logger.error(f"Get Balance Failed: {e}")
+            return 0.0
+
+    async def get_available_balance(self, asset: str = "USDT") -> float:
+        """Kullanılabilir bakiyeyi çek (Mevcut olmayan marjin hariç)"""
+        if self.simulation_mode:
+            return 1000.0
+        
+        if not self.client:
+            logger.error("Client not connected!")
+            return 0.0
+        
+        try:
+            account_info = await self.client.futures_account_balance()
+            for item in account_info:
+                if item["asset"] == asset:
+                    return float(item["withdrawAvailable"])
+            return 0.0
+        except Exception as e:
+            logger.error(f"Get Available Balance Failed: {e}")
